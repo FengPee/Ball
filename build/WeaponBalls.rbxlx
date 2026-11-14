@@ -1,0 +1,2650 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Codec</string>
+          <string name="Source"><![CDATA[-- Packs an arena snapshot into a small buffer for an UnreliableRemoteEvent
+-- (those are capped at roughly 1000 bytes, so we keep each entity to 26 bytes).
+local Codec = {}
+
+local HEADER = 4 -- plot u8, count u8, seq u16
+local ENTITY = 26 -- id u16, kind u8, tier u8, wtype u8, r u8, x/z/angle/hp/maxHp f32
+
+function Codec.encode(plot: number, seq: number, entities): buffer
+	local n = math.min(#entities, 30)
+	local b = buffer.create(HEADER + ENTITY * n)
+	buffer.writeu8(b, 0, plot)
+	buffer.writeu8(b, 1, n)
+	buffer.writeu16(b, 2, seq)
+	local o = HEADER
+	for i = 1, n do
+		local e = entities[i]
+		buffer.writeu16(b, o, e.id)
+		buffer.writeu8(b, o + 2, e.kind)
+		buffer.writeu8(b, o + 3, e.tier)
+		buffer.writeu8(b, o + 4, e.wtype)
+		buffer.writeu8(b, o + 5, math.clamp(math.floor(e.r * 10 + 0.5), 0, 255))
+		buffer.writef32(b, o + 6, e.x)
+		buffer.writef32(b, o + 10, e.z)
+		buffer.writef32(b, o + 14, e.angle)
+		buffer.writef32(b, o + 18, math.max(e.hp, 0))
+		buffer.writef32(b, o + 22, e.maxHp)
+		o += ENTITY
+	end
+	return b
+end
+
+function Codec.decode(b: buffer)
+	local plot = buffer.readu8(b, 0)
+	local n = buffer.readu8(b, 1)
+	local seq = buffer.readu16(b, 2)
+	local list = table.create(n)
+	local o = HEADER
+	for i = 1, n do
+		list[i] = {
+			id = buffer.readu16(b, o),
+			kind = buffer.readu8(b, o + 2),
+			tier = buffer.readu8(b, o + 3),
+			wtype = buffer.readu8(b, o + 4),
+			r = buffer.readu8(b, o + 5) / 10,
+			x = buffer.readf32(b, o + 6),
+			z = buffer.readf32(b, o + 10),
+			angle = buffer.readf32(b, o + 14),
+			hp = buffer.readf32(b, o + 18),
+			maxHp = buffer.readf32(b, o + 22),
+		}
+		o += ENTITY
+	end
+	return plot, seq, list
+end
+
+-- True if `seq` is newer than `last` (handles wrap-around at 65536).
+function Codec.isNewer(seq: number, last: number?): boolean
+	if last == nil then
+		return true
+	end
+	local diff = (seq - last) % 65536
+	return diff > 0 and diff < 32768
+end
+
+return Codec
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[-- All tunable numbers live here. Pure data: no Roblox APIs, so it runs in tests too.
+local Config = {}
+
+-- Rarity ladder. `oneIn` is shown to players as "1 in X". Colors are RGB 0-255.
+Config.Tiers = {
+	{ name = "Common", oneIn = 1, color = { 200, 200, 205 }, damage = 18, material = "Wooden" },
+	{ name = "Uncommon", oneIn = 4, color = { 110, 220, 110 }, damage = 45, material = "Bronze" },
+	{ name = "Rare", oneIn = 15, color = { 90, 190, 255 }, damage = 110, material = "Steel" },
+	{ name = "Epic", oneIn = 60, color = { 170, 90, 255 }, damage = 240, material = "Amethyst" },
+	{ name = "Legendary", oneIn = 300, color = { 255, 170, 50 }, damage = 520, material = "Golden" },
+	{ name = "Mythic", oneIn = 2000, color = { 255, 70, 110 }, damage = 1150, material = "Crimson" },
+	{ name = "Celestial", oneIn = 12000, color = { 120, 255, 230 }, damage = 2600, material = "Starforged" },
+	{ name = "Cosmic", oneIn = 80000, color = { 80, 60, 230 }, damage = 6000, material = "Void" },
+	{ name = "Eternal", oneIn = 500000, color = { 255, 255, 255 }, damage = 15000, material = "Eternal" },
+}
+
+-- Weapon types change how the weapon orbits and hits. Skewer is the long, fast, weaker one.
+Config.WeaponTypes = {
+	{ name = "Sword", length = 5.0, spin = 5.5, dmgMult = 1.0, cooldown = 0.35 },
+	{ name = "Axe", length = 4.4, spin = 4.2, dmgMult = 1.3, cooldown = 0.45 },
+	{ name = "Mace", length = 4.0, spin = 3.4, dmgMult = 1.6, cooldown = 0.55 },
+	{ name = "Skewer", length = 6.5, spin = 4.8, dmgMult = 0.85, cooldown = 0.3 },
+}
+
+-- Zones are arena upgrades on your own plot. `power` is the requirement to enter.
+Config.Zones = {
+	{
+		name = "Meadow",
+		power = 0,
+		enemyHp = { 25, 50 },
+		enemyDmg = 3,
+		maxEnemies = 4,
+		killsPerKey = 2,
+		bossEvery = 10,
+		bossHp = 700,
+		bossDmg = 5,
+		canDie = false, -- nobody dies in the first zone
+		floor = { 120, 180, 95 },
+	},
+	{
+		name = "Ember Pit",
+		power = 400,
+		enemyHp = { 450, 1000 },
+		enemyDmg = 16,
+		maxEnemies = 5,
+		killsPerKey = 2,
+		bossEvery = 14,
+		bossHp = 9000,
+		bossDmg = 25,
+		canDie = true,
+		floor = { 170, 95, 65 },
+	},
+	{
+		name = "Frost Vault",
+		power = 2500,
+		enemyHp = { 3500, 8000 },
+		enemyDmg = 60,
+		maxEnemies = 6,
+		killsPerKey = 2,
+		bossEvery = 14,
+		bossHp = 80000,
+		bossDmg = 120,
+		canDie = true,
+		floor = { 150, 195, 230 },
+	},
+}
+
+Config.Ball = {
+	radius = 2.2,
+	speed = 20,
+	hp = 100,
+	regen = 4, -- hp per second
+	homing = 14, -- steering toward nearest enemy
+	dashSpeed = 60,
+	dashTime = 0.35,
+	dashCooldown = 3,
+	dashUnlockRolls = 2, -- dash unlocks after this many chest rolls
+	respawn = 3,
+}
+
+Config.Enemy = {
+	radius = 1.8,
+	speed = 14,
+	homing = 9,
+	spawnInterval = 1.0,
+	weaponScale = 0.85,
+	spinScale = 0.8,
+}
+
+Config.Boss = {
+	radius = 3.6,
+	speed = 10,
+	weaponType = 3,
+	weaponScale = 1.7,
+	spin = 2.2,
+	keys = 3,
+}
+
+Config.Knockback = 26
+
+Config.Arena = {
+	half = 24, -- inner half-width in studs
+	wallHeight = 2.5,
+	wallThickness = 1.2,
+	floorY = 1.2, -- top surface of every arena floor
+}
+
+Config.Plot = {
+	count = 8,
+	ringRadius = 110,
+	size = 72,
+}
+
+Config.Rolls = {
+	baseLuck = 1,
+	friendLuck = 0.1, -- extra luck per friend in the server
+	friendLuckCap = 0.5,
+	pityAt = 80, -- guaranteed Epic+ after this many rolls without one
+	pityTier = 4,
+	-- Scripted minimum tier for early rolls so the first minutes always feel good.
+	scripted = { [1] = 2, [3] = 3, [6] = 4 },
+	announceTier = 4, -- Epic and above are announced to the server
+	minInterval = 0.25,
+}
+
+Config.Upgrade = {
+	costPerLevel = 6, -- dust cost = level * costPerLevel * tier
+	bonusPerLevel = 0.1, -- +10% damage per level
+}
+
+Config.Net = {
+	snapshotRate = 20,
+}
+
+Config.Data = {
+	storeName = "BallGame_v1",
+	autosave = 90,
+}
+
+function Config.plotCenter(index: number): (number, number)
+	local angle = (index - 1) / Config.Plot.count * math.pi * 2
+	return math.cos(angle) * Config.Plot.ringRadius, math.sin(angle) * Config.Plot.ringRadius
+end
+
+-- Weapon length for an entity kind (1 player, 2 enemy, 3 boss).
+function Config.weaponLength(kind: number, wtype: number): number
+	local base = Config.WeaponTypes[wtype].length
+	if kind == 2 then
+		return base * Config.Enemy.weaponScale
+	elseif kind == 3 then
+		return base * Config.Boss.weaponScale
+	end
+	return base
+end
+
+function Config.formatNumber(n: number): string
+	if n >= 1e9 then
+		return string.format("%.2fb", n / 1e9)
+	elseif n >= 1e6 then
+		return string.format("%.2fm", n / 1e6)
+	elseif n >= 1e4 then
+		return string.format("%.1fk", n / 1e3)
+	end
+	return tostring(math.floor(n + 0.5))
+end
+
+return Config
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">Rolls</string>
+          <string name="Source"><![CDATA[-- Chest rolls, items and upgrade maths. Pure logic so it can be tested outside Roblox.
+-- Always run rolls on the server: the client only ever sees the result.
+local Config = require(script.Parent.Config)
+
+local Rolls = {}
+
+export type Item = { tier: number, wtype: number, damage: number, level: number }
+
+-- Picks a tier. Checks from rarest down, so each tier really is "1 in oneIn / luck".
+function Rolls.rollTier(rng: () -> number, luck: number, minTier: number?): number
+	local floor = minTier or 1
+	for i = #Config.Tiers, 2, -1 do
+		if rng() < luck / Config.Tiers[i].oneIn then
+			return math.max(i, floor)
+		end
+	end
+	return math.max(1, floor)
+end
+
+function Rolls.makeItem(rng: () -> number, tier: number): Item
+	local wtype = math.floor(rng() * #Config.WeaponTypes) + 1
+	local spread = 0.85 + rng() * 0.3
+	local damage = Config.Tiers[tier].damage * Config.WeaponTypes[wtype].dmgMult * spread
+	return { tier = tier, wtype = wtype, damage = math.floor(damage + 0.5), level = 1 }
+end
+
+-- Rolls one item for a player's save data, applying scripted early rolls and pity.
+-- Mutates data.rolls and data.pity.
+function Rolls.roll(data, luck: number, rng: () -> number): Item
+	data.rolls += 1
+	local minTier = Config.Rolls.scripted[data.rolls] or 1
+	if data.pity + 1 >= Config.Rolls.pityAt then
+		minTier = math.max(minTier, Config.Rolls.pityTier)
+	end
+	local tier = Rolls.rollTier(rng, luck, minTier)
+	if tier >= Config.Rolls.pityTier then
+		data.pity = 0
+	else
+		data.pity += 1
+	end
+	return Rolls.makeItem(rng, tier)
+end
+
+function Rolls.power(item: Item): number
+	return math.floor(item.damage * (1 + Config.Upgrade.bonusPerLevel * (item.level - 1)) + 0.5)
+end
+
+function Rolls.itemName(item: Item): string
+	return Config.Tiers[item.tier].material .. " " .. Config.WeaponTypes[item.wtype].name
+end
+
+function Rolls.salvageValue(item: Item): number
+	return item.tier * item.tier * 2 + (item.level - 1) * 2
+end
+
+function Rolls.upgradeCost(item: Item): number
+	return item.level * Config.Upgrade.costPerLevel * item.tier
+end
+
+function Rolls.starterItem(): Item
+	return { tier = 1, wtype = 1, damage = Config.Tiers[1].damage, level = 1 }
+end
+
+return Rolls
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">Sim</string>
+          <string name="Source"><![CDATA[-- One player's arena: balls bouncing on a flat floor with weapons orbiting them.
+-- Runs on the server only. Pure maths on x/z numbers (no Roblox physics), so it is
+-- cheap, deterministic enough to test, and the client can't cheat it.
+local Config = require(script.Parent.Config)
+
+local KIND_PLAYER, KIND_ENEMY, KIND_BOSS = 1, 2, 3
+
+local Sim = {}
+Sim.__index = Sim
+
+function Sim.new(cx: number, cz: number, rng: () -> number)
+	local self = setmetatable({}, Sim)
+	self.cx, self.cz = cx, cz
+	self.half = Config.Arena.half
+	self.rng = rng
+	self.time = 0
+	self.nextId = 0
+	self.player = nil
+	self.enemies = {}
+	self.zone = 1
+	self.killsSinceBoss = 0
+	self.bossAlive = false
+	self.spawnTimer = 0.5
+	self.dashReady = 0
+	return self
+end
+
+function Sim:_id(): number
+	self.nextId = self.nextId % 65000 + 1
+	return self.nextId
+end
+
+function Sim:_randomDir(): (number, number)
+	local a = self.rng() * math.pi * 2
+	return math.cos(a), math.sin(a)
+end
+
+-- loadout = { damage, wtype, tier }
+function Sim:setLoadout(loadout)
+	local p = self.player
+	if not p then
+		local dx, dz = self:_randomDir()
+		p = {
+			id = self:_id(),
+			kind = KIND_PLAYER,
+			x = self.cx,
+			z = self.cz,
+			vx = dx * Config.Ball.speed,
+			vz = dz * Config.Ball.speed,
+			r = Config.Ball.radius,
+			speed = Config.Ball.speed,
+			hp = Config.Ball.hp,
+			maxHp = Config.Ball.hp,
+			angle = 0,
+			spinDir = 1,
+			hitCd = {},
+			alive = true,
+		}
+		self.player = p
+	end
+	local wt = Config.WeaponTypes[loadout.wtype]
+	p.dmg = loadout.damage
+	p.wtype = loadout.wtype
+	p.tier = loadout.tier
+	p.length = Config.weaponLength(KIND_PLAYER, loadout.wtype)
+	p.spin = wt.spin
+	p.cooldown = wt.cooldown
+end
+
+function Sim:setZone(zone: number)
+	self.zone = zone
+	self.enemies = {}
+	self.killsSinceBoss = 0
+	self.bossAlive = false
+	self.spawnTimer = 0.5
+	local p = self.player
+	if p then
+		p.hp = p.maxHp
+		p.alive = true
+		p.hitCd = {}
+	end
+end
+
+function Sim:_spawnEnemy(boss: boolean)
+	local zone = Config.Zones[self.zone]
+	local r = boss and Config.Boss.radius or Config.Enemy.radius
+	local p = self.player
+	local x, z = self.cx, self.cz
+	for _ = 1, 12 do
+		x = self.cx + (self.rng() * 2 - 1) * (self.half - r)
+		z = self.cz + (self.rng() * 2 - 1) * (self.half - r)
+		if not p or (x - p.x) ^ 2 + (z - p.z) ^ 2 > 100 then
+			break
+		end
+	end
+	local wtype = boss and Config.Boss.weaponType or (math.floor(self.rng() * 3) + 1)
+	local wt = Config.WeaponTypes[wtype]
+	local hp = boss and zone.bossHp or (zone.enemyHp[1] + self.rng() * (zone.enemyHp[2] - zone.enemyHp[1]))
+	hp = math.floor(hp)
+	local speed = boss and Config.Boss.speed or Config.Enemy.speed
+	local dx, dz = self:_randomDir()
+	local kind = boss and KIND_BOSS or KIND_ENEMY
+	local e = {
+		id = self:_id(),
+		kind = kind,
+		x = x,
+		z = z,
+		vx = dx * speed,
+		vz = dz * speed,
+		r = r,
+		speed = speed,
+		hp = hp,
+		maxHp = hp,
+		dmg = boss and zone.bossDmg or zone.enemyDmg,
+		wtype = wtype,
+		tier = 0,
+		length = Config.weaponLength(kind, wtype),
+		spin = boss and Config.Boss.spin or wt.spin * Config.Enemy.spinScale,
+		cooldown = wt.cooldown,
+		angle = self.rng() * math.pi * 2,
+		spinDir = self.rng() < 0.5 and -1 or 1,
+		hitCd = {},
+		alive = true,
+	}
+	table.insert(self.enemies, e)
+	if boss then
+		self.bossAlive = true
+	end
+	return e
+end
+
+function Sim:_nearestEnemy(x: number, z: number)
+	local best, bestD = nil, math.huge
+	for _, e in self.enemies do
+		local d = (e.x - x) ^ 2 + (e.z - z) ^ 2
+		if d < bestD then
+			best, bestD = e, d
+		end
+	end
+	return best
+end
+
+local function pointSegDist(px, pz, x1, z1, x2, z2): number
+	local dx, dz = x2 - x1, z2 - z1
+	local len2 = dx * dx + dz * dz
+	local t = 0
+	if len2 > 0 then
+		t = math.clamp(((px - x1) * dx + (pz - z1) * dz) / len2, 0, 1)
+	end
+	local qx, qz = x1 + dx * t, z1 + dz * t
+	return math.sqrt((px - qx) ^ 2 + (pz - qz) ^ 2)
+end
+
+-- Attacker `a` swings at target `b`. Returns true on a hit.
+function Sim:_tryHit(a, b, events): boolean
+	if b.hp <= 0 then
+		return false
+	end
+	local ca, sa = math.cos(a.angle), math.sin(a.angle)
+	local x1, z1 = a.x + ca * a.r * 0.6, a.z + sa * a.r * 0.6
+	local x2, z2 = a.x + ca * (a.r + a.length), a.z + sa * (a.r + a.length)
+	if pointSegDist(b.x, b.z, x1, z1, x2, z2) > b.r then
+		return false
+	end
+	local last = a.hitCd[b.id]
+	if last and self.time - last < a.cooldown then
+		return false
+	end
+	a.hitCd[b.id] = self.time
+	b.hp -= a.dmg
+	-- Knock the target away from the attacker and flip the attacker's spin.
+	local nx, nz = b.x - a.x, b.z - a.z
+	local d = math.sqrt(nx * nx + nz * nz)
+	if d > 0.001 then
+		local kb = Config.Knockback * (b.kind == KIND_BOSS and 0.35 or 1)
+		b.vx += nx / d * kb
+		b.vz += nz / d * kb
+	end
+	a.spinDir = -a.spinDir
+	table.insert(events, { type = "hit", attacker = a.id, target = b.id, dmg = a.dmg, x = b.x, z = b.z })
+	return true
+end
+
+function Sim:dash(): boolean
+	local p = self.player
+	if not p or not p.alive or self.time < self.dashReady then
+		return false
+	end
+	local dx, dz = p.vx, p.vz
+	local e = self:_nearestEnemy(p.x, p.z)
+	if e then
+		dx, dz = e.x - p.x, e.z - p.z
+	end
+	local d = math.sqrt(dx * dx + dz * dz)
+	if d < 0.001 then
+		dx, dz, d = 1, 0, 1
+	end
+	p.vx, p.vz = dx / d * Config.Ball.dashSpeed, dz / d * Config.Ball.dashSpeed
+	p.dashUntil = self.time + Config.Ball.dashTime
+	self.dashReady = self.time + Config.Ball.dashCooldown
+	return true
+end
+
+function Sim:step(dt: number)
+	local events = {}
+	self.time += dt
+	local t = self.time
+	local zone = Config.Zones[self.zone]
+	local p = self.player
+	if not p then
+		return events
+	end
+
+	-- Respawn and regen
+	if not p.alive and t >= p.respawnAt then
+		p.alive = true
+		p.hp = p.maxHp
+		p.x, p.z = self.cx, self.cz
+		table.insert(events, { type = "respawn" })
+	end
+	if p.alive then
+		p.hp = math.min(p.maxHp, p.hp + Config.Ball.regen * dt)
+	end
+
+	-- Spawning
+	self.spawnTimer -= dt
+	if self.spawnTimer <= 0 then
+		self.spawnTimer = Config.Enemy.spawnInterval
+		if self.killsSinceBoss >= zone.bossEvery and not self.bossAlive then
+			self:_spawnEnemy(true)
+			self.killsSinceBoss = 0
+			table.insert(events, { type = "boss" })
+		elseif #self.enemies < zone.maxEnemies then
+			self:_spawnEnemy(false)
+		end
+	end
+
+	local all = {}
+	if p.alive then
+		table.insert(all, p)
+	end
+	for _, e in self.enemies do
+		table.insert(all, e)
+	end
+
+	-- Movement
+	local minX, maxX = self.cx - self.half, self.cx + self.half
+	local minZ, maxZ = self.cz - self.half, self.cz + self.half
+	for _, e in all do
+		local target = e.speed
+		if e.dashUntil and t < e.dashUntil then
+			target = Config.Ball.dashSpeed
+		end
+		local other, homing
+		if e == p then
+			other, homing = self:_nearestEnemy(p.x, p.z), Config.Ball.homing
+		elseif p.alive then
+			other, homing = p, Config.Enemy.homing
+		end
+		if other then
+			local dx, dz = other.x - e.x, other.z - e.z
+			local d = math.sqrt(dx * dx + dz * dz)
+			if d > 0.01 then
+				e.vx += dx / d * homing * dt
+				e.vz += dz / d * homing * dt
+			end
+		end
+		local s = math.sqrt(e.vx * e.vx + e.vz * e.vz)
+		if s < 0.01 then
+			e.vx, e.vz = self:_randomDir()
+			s = 1
+		end
+		local ns = s + (target - s) * math.min(1, dt * 2.5)
+		e.vx, e.vz = e.vx / s * ns, e.vz / s * ns
+		e.x += e.vx * dt
+		e.z += e.vz * dt
+		if e.x - e.r < minX then
+			e.x, e.vx = minX + e.r, math.abs(e.vx)
+		elseif e.x + e.r > maxX then
+			e.x, e.vx = maxX - e.r, -math.abs(e.vx)
+		end
+		if e.z - e.r < minZ then
+			e.z, e.vz = minZ + e.r, math.abs(e.vz)
+		elseif e.z + e.r > maxZ then
+			e.z, e.vz = maxZ - e.r, -math.abs(e.vz)
+		end
+		e.angle = (e.angle + e.spin * e.spinDir * dt) % (math.pi * 2)
+	end
+
+	-- Ball-to-ball bounces (equal-mass elastic along the contact normal)
+	for i = 1, #all do
+		local a = all[i]
+		for j = i + 1, #all do
+			local b = all[j]
+			local dx, dz = b.x - a.x, b.z - a.z
+			local d = math.sqrt(dx * dx + dz * dz)
+			local overlap = a.r + b.r - d
+			if overlap > 0 and d > 0.001 then
+				local nx, nz = dx / d, dz / d
+				a.x -= nx * overlap / 2
+				a.z -= nz * overlap / 2
+				b.x += nx * overlap / 2
+				b.z += nz * overlap / 2
+				local rel = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz
+				if rel > 0 then
+					a.vx -= rel * nx
+					a.vz -= rel * nz
+					b.vx += rel * nx
+					b.vz += rel * nz
+				end
+			end
+		end
+	end
+
+	-- Weapon hits
+	if p.alive then
+		for _, e in self.enemies do
+			self:_tryHit(p, e, events)
+			if p.hp > 0 then
+				self:_tryHit(e, p, events)
+			end
+		end
+	end
+
+	-- Deaths
+	for i = #self.enemies, 1, -1 do
+		local e = self.enemies[i]
+		if e.hp <= 0 then
+			table.remove(self.enemies, i)
+			p.hitCd[e.id] = nil
+			if e.kind == KIND_BOSS then
+				self.bossAlive = false
+			else
+				self.killsSinceBoss += 1
+			end
+			table.insert(events, { type = "kill", id = e.id, kind = e.kind, x = e.x, z = e.z, r = e.r })
+		end
+	end
+	if p.alive and p.hp <= 0 then
+		if zone.canDie then
+			p.alive = false
+			p.respawnAt = t + Config.Ball.respawn
+			table.insert(events, { type = "down", x = p.x, z = p.z })
+		else
+			p.hp = 1
+		end
+	end
+
+	return events
+end
+
+-- Everything the client needs to draw this arena.
+function Sim:entities()
+	local list = {}
+	local p = self.player
+	if p and p.alive then
+		table.insert(list, p)
+	end
+	for _, e in self.enemies do
+		table.insert(list, e)
+	end
+	return list
+end
+
+Sim.KIND_PLAYER, Sim.KIND_ENEMY, Sim.KIND_BOSS = KIND_PLAYER, KIND_ENEMY, KIND_BOSS
+
+return Sim
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="6">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="7">
+      <Properties>
+        <string name="Name">Server</string>
+      </Properties>
+      <Item class="Script" referent="8">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[-- Server entry point. Owns every player's arena simulation, rolls and save data.
+-- Clients only send requests ("roll", "dash", ...) and draw what the server says.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = require(Shared.Config)
+local Rolls = require(Shared.Rolls)
+local Sim = require(Shared.Sim)
+local Codec = require(Shared.Codec)
+local World = require(script.Parent.World)
+local PlayerData = require(script.Parent.PlayerData)
+
+-- Remotes ---------------------------------------------------------------------
+local remotes = Instance.new("Folder")
+remotes.Name = "Remotes"
+local function remote(class: string, name: string)
+	local r = Instance.new(class)
+	r.Name = name
+	r.Parent = remotes
+	return r
+end
+local SnapshotRE = remote("UnreliableRemoteEvent", "Snapshot") -- arena positions, 20x a second
+local FxRE = remote("RemoteEvent", "Fx") -- kills, bosses, announcements
+local StateRE = remote("RemoteEvent", "State") -- your keys, power, zone...
+local RollRF = remote("RemoteFunction", "Roll")
+local ActionRE = remote("RemoteEvent", "Action") -- equip, salvage, dash, zone, upgrade
+remotes.Parent = ReplicatedStorage
+
+World.build()
+
+-- Sessions --------------------------------------------------------------------
+local sessions = {} -- [Player] = session
+local plotOwners = {} -- [plotIndex] = Player
+
+local function claimPlot(player: Player): number?
+	for i = 1, Config.Plot.count do
+		if not plotOwners[i] then
+			plotOwners[i] = player
+			return i
+		end
+	end
+	return nil
+end
+
+local function loadout(item)
+	return { damage = Rolls.power(item), wtype = item.wtype, tier = item.tier }
+end
+
+local function pushState(s)
+	local d = s.data
+	local eq = d.equipped
+	local nextZone = Config.Zones[d.zone + 1]
+	StateRE:FireClient(s.player, {
+		plot = s.plot,
+		keys = d.keys,
+		dust = d.dust,
+		rolls = d.rolls,
+		zone = d.zone,
+		nextZonePower = nextZone and nextZone.power or nil,
+		best = d.best,
+		found = d.found,
+		power = Rolls.power(eq),
+		equippedName = Rolls.itemName(eq),
+		equippedTier = eq.tier,
+		level = eq.level,
+		upgradeCost = Rolls.upgradeCost(eq),
+		dashUnlocked = d.rolls >= Config.Ball.dashUnlockRolls,
+		luck = s.luck,
+		friends = s.friends,
+	})
+end
+
+local function refreshStats(s)
+	local eq = s.data.equipped
+	s.arena:setLoadout(loadout(eq))
+	s.powerStat.Value = Rolls.power(eq)
+	s.bestStat.Value = Config.Tiers[s.data.best].name
+	World.setOwner(s.plot, string.format("%s\nBest: %s", s.player.DisplayName, Config.Tiers[s.data.best].name))
+end
+
+local function salvagePending(s)
+	if s.pending then
+		s.data.dust += Rolls.salvageValue(s.pending)
+		s.pending = nil
+	end
+end
+
+-- Friend luck: +10% roll luck for each friend in your server.
+local friendCache = {}
+local function areFriends(a: Player, b: Player): boolean
+	local k = math.min(a.UserId, b.UserId) .. ":" .. math.max(a.UserId, b.UserId)
+	if friendCache[k] == nil then
+		local ok, result = pcall(a.IsFriendsWith, a, b.UserId)
+		friendCache[k] = ok and result or false
+	end
+	return friendCache[k]
+end
+
+local function recalcLuck()
+	local list = Players:GetPlayers()
+	for _, p in list do
+		local s = sessions[p]
+		if s then
+			local friends = 0
+			for _, q in list do
+				if q ~= p and areFriends(p, q) then
+					friends += 1
+				end
+			end
+			s.friends = friends
+			s.luck = Config.Rolls.baseLuck + math.min(friends * Config.Rolls.friendLuck, Config.Rolls.friendLuckCap)
+			pushState(s)
+		end
+	end
+end
+
+local function placeCharacter(s, character: Model)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+	if root and sessions[s.player] == s then
+		character:PivotTo(World.plots[s.plot].spawnCFrame)
+	end
+end
+
+local function onPlayerAdded(player: Player)
+	local plot = claimPlot(player)
+	if not plot then
+		player:Kick("This server is full, please join another one.")
+		return
+	end
+	local data, canSave = PlayerData.load(player)
+	if not player.Parent then
+		plotOwners[plot] = nil
+		return
+	end
+
+	local center = World.plots[plot].center
+	local s = {
+		player = player,
+		plot = plot,
+		data = data,
+		canSave = canSave,
+		arena = Sim.new(center.X, center.Z, math.random),
+		pending = nil,
+		lastRoll = 0,
+		lastZone = 0,
+		keyProgress = 0,
+		seq = 0,
+		luck = Config.Rolls.baseLuck,
+		friends = 0,
+	}
+
+	local stats = Instance.new("Folder")
+	stats.Name = "leaderstats"
+	s.powerStat = Instance.new("IntValue")
+	s.powerStat.Name = "Power"
+	s.powerStat.Parent = stats
+	s.bestStat = Instance.new("StringValue")
+	s.bestStat.Name = "Best"
+	s.bestStat.Parent = stats
+	stats.Parent = player
+
+	sessions[player] = s
+	s.arena:setZone(data.zone)
+	World.setZone(plot, data.zone)
+	refreshStats(s)
+
+	player.CharacterAdded:Connect(function(character)
+		placeCharacter(s, character)
+	end)
+	if player.Character then
+		task.spawn(placeCharacter, s, player.Character)
+	end
+
+	pushState(s)
+	task.spawn(recalcLuck)
+end
+
+local function onPlayerRemoving(player: Player)
+	local s = sessions[player]
+	if not s then
+		return
+	end
+	salvagePending(s)
+	sessions[player] = nil
+	plotOwners[s.plot] = nil
+	World.setOwner(s.plot, "Empty plot")
+	World.setZone(s.plot, 1)
+	FxRE:FireAllClients({ t = "clear", plot = s.plot })
+	PlayerData.save(player, s.data, s.canSave)
+	task.spawn(recalcLuck)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+for _, p in Players:GetPlayers() do
+	task.spawn(onPlayerAdded, p)
+end
+
+-- Arena events ----------------------------------------------------------------
+local function handleEvent(s, ev)
+	if ev.type == "kill" then
+		local d = s.data
+		local keys = 0
+		d.kills += 1
+		if ev.kind == Sim.KIND_BOSS then
+			keys = Config.Boss.keys
+		else
+			s.keyProgress += 1
+			-- The very first kill always pays out, so the first roll comes fast.
+			if d.kills == 1 or s.keyProgress >= Config.Zones[d.zone].killsPerKey then
+				keys = 1
+				s.keyProgress = 0
+			end
+		end
+		d.keys += keys
+		FxRE:FireAllClients({ t = "kill", plot = s.plot, x = ev.x, z = ev.z, r = ev.r, kind = ev.kind, keys = keys })
+		if keys > 0 then
+			pushState(s)
+		end
+	elseif ev.type == "boss" then
+		FxRE:FireAllClients({ t = "boss", plot = s.plot })
+	elseif ev.type == "down" then
+		FxRE:FireClient(s.player, { t = "down", seconds = Config.Ball.respawn })
+	end
+end
+
+local snapshotAcc = 0
+RunService.Heartbeat:Connect(function(dt)
+	dt = math.min(dt, 0.05)
+	for _, s in sessions do
+		for _, ev in s.arena:step(dt) do
+			handleEvent(s, ev)
+		end
+	end
+	snapshotAcc += dt
+	if snapshotAcc >= 1 / Config.Net.snapshotRate then
+		snapshotAcc = 0
+		for _, s in sessions do
+			s.seq = (s.seq + 1) % 65536
+			SnapshotRE:FireAllClients(Codec.encode(s.plot, s.seq, s.arena:entities()))
+		end
+	end
+end)
+
+-- Rolling ---------------------------------------------------------------------
+RollRF.OnServerInvoke = function(player: Player)
+	local s = sessions[player]
+	if not s then
+		return { ok = false, msg = "Still loading..." }
+	end
+	local now = os.clock()
+	if now - s.lastRoll < Config.Rolls.minInterval then
+		return { ok = false, msg = "Slow down!" }
+	end
+	local d = s.data
+	if d.keys < 1 then
+		return { ok = false, msg = "No keys! Defeat enemies to earn keys." }
+	end
+	s.lastRoll = now
+	salvagePending(s)
+	d.keys -= 1
+
+	local item = Rolls.roll(d, s.luck, math.random)
+	s.pending = item
+	d.found[item.tier] = true
+	local newBest = item.tier > d.best
+	if newBest then
+		d.best = item.tier
+	end
+	refreshStats(s)
+	pushState(s)
+
+	local tier = Config.Tiers[item.tier]
+	if item.tier >= Config.Rolls.announceTier then
+		-- Wait for the roll animation to finish before telling everyone.
+		task.delay(2.2, function()
+			FxRE:FireAllClients({
+				t = "announce",
+				plot = s.plot,
+				name = player.DisplayName,
+				tier = item.tier,
+				item = Rolls.itemName(item),
+				oneIn = tier.oneIn,
+			})
+		end)
+	end
+
+	local eq = d.equipped
+	return {
+		ok = true,
+		tier = item.tier,
+		wtype = item.wtype,
+		name = Rolls.itemName(item),
+		power = Rolls.power(item),
+		oneIn = tier.oneIn,
+		salvage = Rolls.salvageValue(item),
+		currentName = Rolls.itemName(eq),
+		currentTier = eq.tier,
+		currentPower = Rolls.power(eq),
+		newBest = newBest,
+	}
+end
+
+-- Actions ---------------------------------------------------------------------
+ActionRE.OnServerEvent:Connect(function(player: Player, action, arg)
+	local s = sessions[player]
+	if not s or type(action) ~= "string" then
+		return
+	end
+	local d = s.data
+	if action == "equip" then
+		if s.pending then
+			d.dust += Rolls.salvageValue(d.equipped)
+			d.equipped = s.pending
+			s.pending = nil
+			refreshStats(s)
+			pushState(s)
+		end
+	elseif action == "salvage" then
+		if s.pending then
+			salvagePending(s)
+			pushState(s)
+		end
+	elseif action == "dash" then
+		if d.rolls >= Config.Ball.dashUnlockRolls then
+			s.arena:dash()
+		end
+	elseif action == "zone" then
+		if type(arg) ~= "number" or (arg ~= 1 and arg ~= -1) then
+			return
+		end
+		local now = os.clock()
+		if now - s.lastZone < 1 then
+			return
+		end
+		local target = d.zone + arg
+		local zone = Config.Zones[target]
+		if not zone then
+			return
+		end
+		if arg > 0 and Rolls.power(d.equipped) < zone.power then
+			FxRE:FireClient(player, { t = "toast", text = "Need " .. zone.power .. " power for " .. zone.name })
+			return
+		end
+		s.lastZone = now
+		d.zone = target
+		s.keyProgress = 0
+		s.arena:setZone(target)
+		World.setZone(s.plot, target)
+		FxRE:FireAllClients({ t = "clear", plot = s.plot })
+		FxRE:FireClient(player, { t = "toast", text = "Entered " .. zone.name .. "!" })
+		pushState(s)
+	elseif action == "upgrade" then
+		local cost = Rolls.upgradeCost(d.equipped)
+		if d.dust >= cost then
+			d.dust -= cost
+			d.equipped.level += 1
+			refreshStats(s)
+			pushState(s)
+		end
+	end
+end)
+
+-- Saving ----------------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(Config.Data.autosave)
+		for player, s in sessions do
+			task.spawn(PlayerData.save, player, s.data, s.canSave)
+		end
+	end
+end)
+
+game:BindToClose(function()
+	local pending = 0
+	for player, s in sessions do
+		pending += 1
+		task.spawn(function()
+			salvagePending(s)
+			PlayerData.save(player, s.data, s.canSave)
+			pending -= 1
+		end)
+	end
+	local start = os.clock()
+	while pending > 0 and os.clock() - start < 25 do
+		task.wait(0.1)
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">PlayerData</string>
+          <string name="Source"><![CDATA[-- Loads and saves player progress with DataStoreService.
+-- In Studio, saving only works with Game Settings > Security > "Enable Studio
+-- Access to API Services" turned on. Without it the game still runs; progress
+-- just isn't kept between sessions.
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Config = require(ReplicatedStorage.Shared.Config)
+local Rolls = require(ReplicatedStorage.Shared.Rolls)
+
+local PlayerData = {}
+
+local store
+do
+	local ok, err = pcall(function()
+		store = DataStoreService:GetDataStore(Config.Data.storeName)
+	end)
+	if not ok then
+		warn("[PlayerData] DataStore unavailable, progress will not save:", err)
+	end
+end
+
+local function defaults()
+	local found = table.create(#Config.Tiers, false)
+	found[1] = true
+	return {
+		v = 1,
+		keys = 0,
+		dust = 0,
+		rolls = 0,
+		pity = 0,
+		kills = 0,
+		zone = 1,
+		best = 1,
+		found = found,
+		equipped = Rolls.starterItem(),
+	}
+end
+
+local function reconcile(saved)
+	local data = defaults()
+	if type(saved) ~= "table" then
+		return data
+	end
+	for k, v in saved do
+		if data[k] ~= nil and type(v) == type(data[k]) then
+			data[k] = v
+		end
+	end
+	for i = 1, #Config.Tiers do
+		if type(data.found[i]) ~= "boolean" then
+			data.found[i] = false
+		end
+	end
+	local eq = data.equipped
+	if type(eq.tier) ~= "number" or not Config.Tiers[eq.tier] or not Config.WeaponTypes[eq.wtype] then
+		data.equipped = Rolls.starterItem()
+	end
+	data.equipped.level = data.equipped.level or 1
+	data.zone = math.clamp(data.zone, 1, #Config.Zones)
+	return data
+end
+
+local function key(player: Player): string
+	return "p_" .. player.UserId
+end
+
+function PlayerData.load(player: Player)
+	if not store then
+		return defaults(), false
+	end
+	for attempt = 1, 3 do
+		local ok, result = pcall(function()
+			return store:GetAsync(key(player))
+		end)
+		if ok then
+			return reconcile(result), true
+		end
+		warn(string.format("[PlayerData] load failed for %s (attempt %d): %s", player.Name, attempt, tostring(result)))
+		if RunService:IsStudio() then
+			break -- usually "API access disabled": don't make the tester wait
+		end
+		task.wait(attempt)
+	end
+	-- Never save over real data we failed to read.
+	return defaults(), false
+end
+
+function PlayerData.save(player: Player, data, canSave: boolean)
+	if not store or not canSave then
+		return
+	end
+	local ok, err = pcall(function()
+		store:SetAsync(key(player), data)
+	end)
+	if not ok then
+		warn("[PlayerData] save failed for " .. player.Name .. ": " .. tostring(err))
+	end
+end
+
+return PlayerData
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="10">
+        <Properties>
+          <string name="Name">World</string>
+          <string name="Source"><![CDATA[-- Builds the map in code: grass, the central plaza, and 8 plots in a ring.
+-- Each plot has a walled arena (the "stadium"), a chest and an owner sign.
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage.Shared.Config)
+
+local World = {}
+World.plots = {}
+
+local function rgb(t)
+	return Color3.fromRGB(t[1], t[2], t[3])
+end
+
+local function part(props)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	for k, v in props do
+		p[k] = v
+	end
+	return p
+end
+
+local function billboard(parent, text, size, maxDistance)
+	local gui = Instance.new("BillboardGui")
+	gui.Size = size
+	gui.MaxDistance = maxDistance
+	gui.LightInfluence = 0
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.TextScaled = true
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.3
+	label.Text = text
+	label.Parent = gui
+	gui.Parent = parent
+	return label
+end
+
+local function buildChest(parent, cf)
+	local chest = Instance.new("Model")
+	chest.Name = "Chest"
+	part({
+		Name = "Body",
+		Size = Vector3.new(4.5, 2.4, 3.2),
+		CFrame = cf * CFrame.new(0, 1.2, 0),
+		Color = Color3.fromRGB(190, 40, 45),
+		Material = Enum.Material.SmoothPlastic,
+		Parent = chest,
+	})
+	part({
+		Name = "Lid",
+		Size = Vector3.new(4.7, 1.1, 3.4),
+		CFrame = cf * CFrame.new(0, 2.95, 0),
+		Color = Color3.fromRGB(220, 60, 60),
+		Material = Enum.Material.SmoothPlastic,
+		Parent = chest,
+	})
+	part({
+		Name = "Lock",
+		Size = Vector3.new(0.9, 1.1, 0.3),
+		CFrame = cf * CFrame.new(0, 2.3, -1.75),
+		Color = Color3.fromRGB(255, 205, 60),
+		Material = Enum.Material.Neon,
+		Parent = chest,
+	})
+	for _, x in { -2.1, 2.1 } do
+		part({
+			Name = "Trim",
+			Size = Vector3.new(0.35, 3.6, 3.5),
+			CFrame = cf * CFrame.new(x, 1.8, 0),
+			Color = Color3.fromRGB(255, 205, 60),
+			Material = Enum.Material.SmoothPlastic,
+			Parent = chest,
+		})
+	end
+	chest.Parent = parent
+	return chest
+end
+
+local function buildPlot(index, parent)
+	local cx, cz = Config.plotCenter(index)
+	local center = Vector3.new(cx, 0, cz)
+	local toPlaza = Vector3.new(-cx, 0, -cz).Unit
+	local half = Config.Arena.half
+	local wall = Config.Arena.wallThickness
+	local floorY = Config.Arena.floorY
+
+	local model = Instance.new("Model")
+	model.Name = "Plot" .. index
+	model:SetAttribute("Index", index)
+
+	part({
+		Name = "Pad",
+		Size = Vector3.new(Config.Plot.size, 0.6, Config.Plot.size),
+		Position = center + Vector3.new(0, 0.3, 0),
+		Color = Color3.fromRGB(205, 200, 185),
+		Material = Enum.Material.Concrete,
+		Parent = model,
+	})
+	local floor = part({
+		Name = "ArenaFloor",
+		Size = Vector3.new(half * 2 + wall * 2, floorY - 0.6, half * 2 + wall * 2),
+		Position = center + Vector3.new(0, (floorY + 0.6) / 2, 0),
+		Color = rgb(Config.Zones[1].floor),
+		Material = Enum.Material.SmoothPlastic,
+		Parent = model,
+	})
+	local wallY = floorY + Config.Arena.wallHeight / 2
+	local wallColor = Color3.fromRGB(55, 60, 75)
+	for _, s in { -1, 1 } do
+		part({
+			Name = "Wall",
+			Size = Vector3.new(half * 2 + wall * 2, Config.Arena.wallHeight, wall),
+			Position = center + Vector3.new(0, wallY, s * (half + wall / 2)),
+			Color = wallColor,
+			Material = Enum.Material.SmoothPlastic,
+			Parent = model,
+		})
+		part({
+			Name = "Wall",
+			Size = Vector3.new(wall, Config.Arena.wallHeight, half * 2),
+			Position = center + Vector3.new(s * (half + wall / 2), wallY, 0),
+			Color = wallColor,
+			Material = Enum.Material.SmoothPlastic,
+			Parent = model,
+		})
+	end
+
+	local chestPos = center + toPlaza * (half + 6) + Vector3.new(0, 0.6, 0)
+	local chestCf = CFrame.lookAt(chestPos, Vector3.new(cx, chestPos.Y, cz))
+	buildChest(model, chestCf)
+
+	local signAnchor = part({
+		Name = "SignAnchor",
+		Size = Vector3.new(1, 1, 1),
+		Position = chestPos + Vector3.new(0, 9, 0),
+		Transparency = 1,
+		CanCollide = false,
+		CanQuery = false,
+		Parent = model,
+	})
+	local ownerLabel = billboard(signAnchor, "Empty plot", UDim2.new(16, 0, 3, 0), 220)
+
+	local spawnPos = center + toPlaza * (half + 11) + Vector3.new(0, 3.5, 0)
+	model.Parent = parent
+
+	World.plots[index] = {
+		index = index,
+		center = center,
+		chestPos = chestPos,
+		spawnCFrame = CFrame.lookAt(spawnPos, Vector3.new(cx, spawnPos.Y, cz)),
+		model = model,
+		floor = floor,
+		ownerLabel = ownerLabel,
+	}
+end
+
+function World.build()
+	Lighting.ClockTime = 14.5
+	Lighting.Brightness = 2.5
+	Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 160)
+
+	local map = Instance.new("Folder")
+	map.Name = "Map"
+	map.Parent = workspace
+
+	part({
+		Name = "Ground",
+		Size = Vector3.new(420, 2, 420),
+		Position = Vector3.new(0, -1, 0),
+		Color = Color3.fromRGB(95, 160, 80),
+		Material = Enum.Material.Grass,
+		Parent = map,
+	})
+	part({
+		Name = "Plaza",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.8, 64, 64),
+		CFrame = CFrame.new(0, 0.4, 0) * CFrame.Angles(0, 0, math.rad(90)),
+		Color = Color3.fromRGB(230, 225, 210),
+		Material = Enum.Material.Slate,
+		Parent = map,
+	})
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Anchored = true
+	spawn.Size = Vector3.new(8, 1, 8)
+	spawn.Position = Vector3.new(0, 0.9, 0)
+	spawn.Neutral = true
+	spawn.Duration = 0
+	spawn.Transparency = 1
+	spawn.CanCollide = false
+	spawn.Parent = map
+	local bossSign = part({
+		Name = "BossSign",
+		Size = Vector3.new(1, 1, 1),
+		Position = Vector3.new(0, 12, 0),
+		Transparency = 1,
+		CanCollide = false,
+		CanQuery = false,
+		Parent = map,
+	})
+	billboard(bossSign, "WORLD BOSS ARENA\ncoming next update", UDim2.new(26, 0, 6, 0), 400)
+
+	local plots = Instance.new("Folder")
+	plots.Name = "Plots"
+	plots.Parent = workspace
+	for i = 1, Config.Plot.count do
+		buildPlot(i, plots)
+	end
+end
+
+function World.setOwner(index: number, text: string)
+	local plot = World.plots[index]
+	if plot then
+		plot.ownerLabel.Text = text
+	end
+end
+
+function World.setZone(index: number, zone: number)
+	local plot = World.plots[index]
+	if plot then
+		plot.floor.Color = rgb(Config.Zones[zone].floor)
+	end
+end
+
+return World
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="11">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="12">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="13">
+        <Properties>
+          <string name="Name">Client</string>
+        </Properties>
+        <Item class="ModuleScript" referent="14">
+          <Properties>
+            <string name="Name">Effects</string>
+            <string name="Source"><![CDATA[-- Purely visual, client-side effects. Nothing here affects gameplay.
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+
+local Effects = {}
+
+local folder = Instance.new("Folder")
+folder.Name = "Effects"
+folder.Parent = workspace
+
+function Effects.rgb(t)
+	return Color3.fromRGB(t[1], t[2], t[3])
+end
+
+function Effects.tierColor(tier: number): Color3
+	local t = Config.Tiers[tier]
+	return t and Effects.rgb(t.color) or Color3.fromRGB(110, 110, 120)
+end
+
+local function anchorAt(pos: Vector3, lifetime: number)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Transparency = 1
+	p.Size = Vector3.new(0.2, 0.2, 0.2)
+	p.Position = pos
+	p.Parent = folder
+	Debris:AddItem(p, lifetime)
+	return p
+end
+
+function Effects.floatText(pos: Vector3, text: string, color: Color3, scale: number?)
+	local s = scale or 1
+	local anchor = anchorAt(pos, 1)
+	local gui = Instance.new("BillboardGui")
+	gui.Size = UDim2.new(4 * s, 0, 1.6 * s, 0)
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.Parent = anchor
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.TextScaled = true
+	label.Text = text
+	label.TextColor3 = color
+	label.TextStrokeTransparency = 0.2
+	label.Parent = gui
+	local info = TweenInfo.new(0.9, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(gui, info, { StudsOffset = Vector3.new(0, 3, 0) }):Play()
+	TweenService:Create(label, info, { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+end
+
+-- Small burst of glowing chips flying out of a point.
+function Effects.burst(pos: Vector3, color: Color3, count: number, size: number, speed: number, lifetime: number)
+	for _ = 1, count do
+		local p = Instance.new("Part")
+		p.Size = Vector3.new(size, size, size)
+		p.Color = color
+		p.Material = Enum.Material.Neon
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.CastShadow = false
+		p.CFrame = CFrame.new(pos) * CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6)
+		p.Parent = folder
+		local a = math.random() * math.pi * 2
+		p.AssemblyLinearVelocity = Vector3.new(math.cos(a) * speed, speed * (0.6 + math.random()), math.sin(a) * speed)
+		p.AssemblyAngularVelocity = Vector3.new(math.random() * 10, math.random() * 10, math.random() * 10)
+		TweenService:Create(p, TweenInfo.new(lifetime), { Size = Vector3.new(0.05, 0.05, 0.05) }):Play()
+		Debris:AddItem(p, lifetime)
+	end
+end
+
+function Effects.hit(pos: Vector3, color: Color3)
+	Effects.burst(pos, color, 4, 0.35, 14, 0.35)
+end
+
+function Effects.shatter(pos: Vector3, color: Color3, r: number)
+	Effects.burst(pos, color, 10, r * 0.45, 20, 0.9)
+	Effects.burst(pos, Color3.new(1, 1, 1), 5, 0.3, 26, 0.5)
+end
+
+-- Tall light beam over a plot's chest for rare rolls, visible from across the map.
+function Effects.beam(pos: Vector3, color: Color3, seconds: number)
+	local beam = Instance.new("Part")
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CanQuery = false
+	beam.CanTouch = false
+	beam.CastShadow = false
+	beam.Material = Enum.Material.Neon
+	beam.Color = color
+	beam.Shape = Enum.PartType.Cylinder
+	beam.Size = Vector3.new(160, 0.5, 0.5)
+	beam.CFrame = CFrame.new(pos + Vector3.new(0, 80, 0)) * CFrame.Angles(0, 0, math.rad(90))
+	beam.Transparency = 0.2
+	beam.Parent = folder
+	TweenService:Create(beam, TweenInfo.new(0.4, Enum.EasingStyle.Back), { Size = Vector3.new(160, 5, 5) }):Play()
+	task.delay(seconds - 0.8, function()
+		TweenService:Create(beam, TweenInfo.new(0.8), { Transparency = 1, Size = Vector3.new(160, 0.2, 0.2) }):Play()
+	end)
+	Debris:AddItem(beam, seconds)
+	Effects.burst(pos + Vector3.new(0, 4, 0), color, 16, 0.6, 30, 1.4)
+end
+
+function Effects.chestPop(plot: number)
+	local plots = workspace:FindFirstChild("Plots")
+	local model = plots and plots:FindFirstChild("Plot" .. plot)
+	local lid = model and model:FindFirstChild("Chest") and model.Chest:FindFirstChild("Lid")
+	if not lid then
+		return
+	end
+	local base = lid:GetAttribute("BaseCFrame") or lid.CFrame
+	lid:SetAttribute("BaseCFrame", base)
+	local up = TweenService:Create(lid, TweenInfo.new(0.15, Enum.EasingStyle.Back), { CFrame = base * CFrame.new(0, 1.2, 0) * CFrame.Angles(math.rad(-25), 0, 0) })
+	up:Play()
+	up.Completed:Once(function()
+		TweenService:Create(lid, TweenInfo.new(0.35, Enum.EasingStyle.Bounce), { CFrame = base }):Play()
+	end)
+end
+
+local shakeUntil, shakeStrength = 0, 0
+function Effects.shake(strength: number, seconds: number)
+	shakeStrength = math.max(shakeStrength, strength)
+	shakeUntil = math.max(shakeUntil, os.clock() + seconds)
+end
+
+function Effects.shakeOffset(): CFrame
+	local now = os.clock()
+	if now > shakeUntil then
+		shakeStrength = 0
+		return CFrame.identity
+	end
+	local s = shakeStrength * (shakeUntil - now) * 4
+	return CFrame.new((math.random() - 0.5) * s, (math.random() - 0.5) * s, (math.random() - 0.5) * s)
+end
+
+return Effects
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="LocalScript" referent="15">
+          <Properties>
+            <string name="Name">Main</string>
+            <string name="Source"><![CDATA[-- Client entry point: wires remotes, input and camera to the UI and renderer.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:GetService("TextChatService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local Effects = require(script.Parent:WaitForChild("Effects"))
+local Render = require(script.Parent:WaitForChild("Render"))
+local Ui = require(script.Parent:WaitForChild("Ui"))
+
+local camera = workspace.CurrentCamera
+local arenaCam = false
+local myPlot = nil
+local dashReadyAt = 0
+
+local function plotCenter(plot: number): Vector3
+	local x, z = Config.plotCenter(plot)
+	return Vector3.new(x, Config.Arena.floorY, z)
+end
+
+local function setArenaCam(on: boolean)
+	arenaCam = on and myPlot ~= nil
+	if not arenaCam then
+		camera.CameraType = Enum.CameraType.Custom
+	end
+	Ui.setCameraLabel(arenaCam)
+end
+
+-- Actions ---------------------------------------------------------------------
+local function roll()
+	local s = Ui.getState()
+	if Ui.busy or not s then
+		return
+	end
+	if s.keys < 1 then
+		Ui.toast("No keys! Kills drop keys.")
+		return
+	end
+	Ui.busy = true
+	Effects.chestPop(s.plot)
+	local ok, result = pcall(function()
+		return Remotes.Roll:InvokeServer()
+	end)
+	if not ok or not result or not result.ok then
+		Ui.toast(result and result.msg or "Roll failed, try again")
+		Ui.busy = false
+		return
+	end
+	Ui.playRoll(result, function(choice)
+		Remotes.Action:FireServer(choice)
+		Ui.busy = false
+	end)
+end
+
+local function dash()
+	local s = Ui.getState()
+	if not s or not s.dashUnlocked then
+		Ui.toast("Dash unlocks after " .. Config.Ball.dashUnlockRolls .. " chest rolls")
+		return
+	end
+	local now = os.clock()
+	if now < dashReadyAt then
+		return
+	end
+	dashReadyAt = now + Config.Ball.dashCooldown
+	Remotes.Action:FireServer("dash")
+	Ui.dashCooldown(Config.Ball.dashCooldown)
+end
+
+Ui.build({
+	roll = roll,
+	dash = dash,
+	upgrade = function()
+		local s = Ui.getState()
+		if s and s.dust < s.upgradeCost then
+			Ui.toast("Salvage gear to get dust")
+			return
+		end
+		Remotes.Action:FireServer("upgrade")
+	end,
+	zone = function(dir)
+		Remotes.Action:FireServer("zone", dir)
+	end,
+	camera = function()
+		setArenaCam(not arenaCam)
+	end,
+})
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.E then
+		roll()
+	elseif input.KeyCode == Enum.KeyCode.F then
+		dash()
+	elseif input.KeyCode == Enum.KeyCode.C then
+		setArenaCam(not arenaCam)
+	end
+end)
+
+-- Remotes ---------------------------------------------------------------------
+Remotes.Snapshot.OnClientEvent:Connect(Render.onSnapshot)
+
+Remotes.State.OnClientEvent:Connect(function(s)
+	local first = myPlot == nil
+	myPlot = s.plot
+	Render.localPlot = s.plot
+	Ui.setState(s)
+	if first then
+		setArenaCam(true) -- drop straight into watching your fight
+	end
+end)
+
+local function systemMessage(message: string)
+	local channels = TextChatService:FindFirstChild("TextChannels")
+	local system = channels and channels:FindFirstChild("RBXSystem")
+	if system then
+		pcall(function()
+			system:DisplaySystemMessage(message)
+		end)
+	end
+end
+
+Remotes.Fx.OnClientEvent:Connect(function(fx)
+	if fx.t == "kill" then
+		local pos = Vector3.new(fx.x, Config.Arena.floorY + fx.r, fx.z)
+		local color = fx.kind == 3 and Color3.fromRGB(150, 30, 60) or Color3.fromRGB(235, 95, 110)
+		Effects.shatter(pos, color, fx.r)
+		if fx.plot == myPlot then
+			if fx.keys > 0 then
+				Effects.floatText(pos + Vector3.new(0, 3, 0), "+" .. fx.keys .. " KEY", Color3.fromRGB(255, 205, 60), 1.5)
+			end
+			Effects.shake(fx.kind == 3 and 1.5 or 0.35, fx.kind == 3 and 0.6 or 0.15)
+			if fx.kind == 3 then
+				Ui.toast("BOSS DEFEATED! +" .. fx.keys .. " keys", Color3.fromRGB(255, 205, 60))
+			end
+		end
+	elseif fx.t == "boss" then
+		if fx.plot == myPlot then
+			Ui.toast("A BOSS APPEARED!", Color3.fromRGB(255, 90, 90))
+			Effects.shake(1, 0.5)
+		end
+	elseif fx.t == "down" then
+		Ui.toast("Your ball was knocked out! Back in " .. fx.seconds .. "s", Color3.fromRGB(255, 110, 110))
+	elseif fx.t == "clear" then
+		Render.clearArena(fx.plot)
+	elseif fx.t == "toast" then
+		Ui.toast(fx.text)
+	elseif fx.t == "announce" then
+		local tier = Config.Tiers[fx.tier]
+		local color = Effects.tierColor(fx.tier)
+		local hex = color:ToHex()
+		systemMessage(string.format(
+			'<font color="#%s"><b>%s rolled %s %s! (1 in %s)</b></font>',
+			hex,
+			fx.name,
+			string.upper(tier.name),
+			fx.item,
+			Config.formatNumber(fx.oneIn)
+		))
+		local x, z = Config.plotCenter(fx.plot)
+		local toPlaza = Vector3.new(-x, 0, -z).Unit
+		local chestPos = Vector3.new(x, 0, z) + toPlaza * (Config.Arena.half + 6)
+		Effects.beam(chestPos, color, 3 + fx.tier)
+		if fx.plot ~= myPlot and fx.tier >= 6 then
+			Ui.toast(fx.name .. " rolled " .. string.upper(tier.name) .. "!", color)
+		end
+	end
+end)
+
+Render.onLocalHit = function(damage)
+	if damage >= 10 then
+		Effects.shake(0.25, 0.12)
+	end
+end
+
+-- Camera ----------------------------------------------------------------------
+-- Arena cam: looking down at your stadium at an angle, from the chest side.
+RunService:BindToRenderStep("ArenaCamera", Enum.RenderPriority.Camera.Value + 1, function()
+	if not arenaCam or not myPlot then
+		return
+	end
+	camera.CameraType = Enum.CameraType.Scriptable
+	local center = plotCenter(myPlot)
+	local toPlaza = Vector3.new(-center.X, 0, -center.Z).Unit
+	local eye = center + toPlaza * 36 + Vector3.new(0, 50, 0)
+	camera.CFrame = CFrame.lookAt(eye, center + toPlaza * 2) * Effects.shakeOffset()
+end)
+
+Players.LocalPlayer.CharacterAdded:Connect(function()
+	if arenaCam then
+		camera.CameraType = Enum.CameraType.Scriptable
+	end
+end)
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="16">
+          <Properties>
+            <string name="Name">Render</string>
+            <string name="Source"><![CDATA[-- Draws every arena from server snapshots. Balls are smoothed toward the latest
+-- server position, and hits are detected from HP drops so the client can add
+-- squash, flash, hop and damage numbers without extra network traffic.
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local Config = require(Shared:WaitForChild("Config"))
+local Codec = require(Shared:WaitForChild("Codec"))
+local Effects = require(script.Parent:WaitForChild("Effects"))
+
+local Render = {}
+Render.localPlot = nil -- set by Main once the server tells us our plot
+Render.onLocalHit = nil -- optional callback(damage) when our ball gets hit
+
+local FLOOR_Y = Config.Arena.floorY
+local PLAYER_COLOR = Color3.fromRGB(90, 215, 120)
+local ENEMY_COLOR = Color3.fromRGB(235, 95, 110)
+local BOSS_COLOR = Color3.fromRGB(150, 30, 60)
+local WOOD = Color3.fromRGB(120, 85, 55)
+
+local folder = Instance.new("Folder")
+folder.Name = "Arenas"
+folder.Parent = workspace
+
+local visuals = {} -- [key] = visual
+local arenaKeys = {} -- [plot] = { [key] = true }
+local lastSeq = {} -- [plot] = seq
+
+local function newPart(parent, size: Vector3, color: Color3, material, cf: CFrame)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Size = size
+	p.Color = color
+	p.Material = material
+	p.CFrame = cf
+	p.Parent = parent
+	return p
+end
+
+-- Builds a weapon pointing along +X from the ball's centre. The model's pivot is
+-- the ball centre, so rotating the pivot swings the weapon around the ball.
+local function buildWeapon(kind: number, tier: number, wtype: number, r: number)
+	local model = Instance.new("Model")
+	model.Name = "Weapon"
+	local length = Config.weaponLength(kind, wtype)
+	local color = Effects.tierColor(tier)
+	local material = Enum.Material.Metal
+	if tier == 1 then
+		material = Enum.Material.Wood
+	elseif tier >= 5 then
+		material = Enum.Material.Neon
+	end
+	local start = r * 0.7
+	local L = length + r * 0.3
+	local th = (kind == 3) and 0.45 or 0.28 -- thickness
+	local function at(x, z)
+		return CFrame.new(start + x, 0, z or 0)
+	end
+	local name = Config.WeaponTypes[wtype].name
+	if name == "Sword" then
+		newPart(model, Vector3.new(L * 0.25, th, th), WOOD, Enum.Material.Wood, at(L * 0.125))
+		newPart(model, Vector3.new(th * 1.2, th * 1.2, th * 4), color, material, at(L * 0.25))
+		newPart(model, Vector3.new(L * 0.72, th * 0.6, th * 2), color, material, at(L * 0.25 + L * 0.36))
+	elseif name == "Axe" then
+		newPart(model, Vector3.new(L, th, th), WOOD, Enum.Material.Wood, at(L * 0.5))
+		newPart(model, Vector3.new(L * 0.28, th * 0.8, th * 5), color, material, at(L * 0.84, th * 1.6))
+	elseif name == "Mace" then
+		newPart(model, Vector3.new(L * 0.8, th, th), WOOD, Enum.Material.Wood, at(L * 0.4))
+		local head = newPart(model, Vector3.new(th * 5, th * 5, th * 5), color, material, at(L * 0.85))
+		head.Shape = Enum.PartType.Ball
+	else -- Skewer: a long thin stick with chunks of food on it
+		newPart(model, Vector3.new(L, th * 0.55, th * 0.55), Color3.fromRGB(215, 190, 140), Enum.Material.Wood, at(L * 0.5))
+		local foods = { Color3.fromRGB(240, 140, 50), Color3.fromRGB(110, 190, 70), Color3.fromRGB(150, 85, 60) }
+		for i, f in foods do
+			newPart(model, Vector3.new(th * 2.6, th * 2.6, th * 2.6), f, Enum.Material.SmoothPlastic, at(L * (0.3 + i * 0.15)))
+		end
+		newPart(model, Vector3.new(th * 1.4, th * 0.8, th * 0.8), color, material, at(L * 0.98))
+	end
+	model.WorldPivot = CFrame.identity
+	return model
+end
+
+local function hpText(hp: number): string
+	return Config.formatNumber(math.ceil(hp))
+end
+
+local function createVisual(plot: number, s)
+	local v = {
+		plot = plot,
+		kind = s.kind,
+		tier = s.tier,
+		wtype = s.wtype,
+		r = s.r,
+		x = s.x,
+		z = s.z,
+		tx = s.x,
+		tz = s.z,
+		a = s.angle,
+		ta = s.angle,
+		hp = s.hp,
+		maxHp = s.maxHp,
+		hopT = 1,
+		flash = 0,
+	}
+	local color = (s.kind == 1 and PLAYER_COLOR) or (s.kind == 3 and BOSS_COLOR) or ENEMY_COLOR
+	v.color = color
+	local model = Instance.new("Model")
+	model.Name = "Ball"
+	local ball = newPart(model, Vector3.new(s.r * 2, s.r * 2, s.r * 2), color, Enum.Material.SmoothPlastic, CFrame.new(s.x, FLOOR_Y + s.r, s.z))
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Sphere
+	mesh.Parent = ball
+	local gui = Instance.new("BillboardGui")
+	gui.Size = UDim2.new(s.r * 1.8, 0, s.r * 1.1, 0)
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.MaxDistance = 160
+	gui.Parent = ball
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.TextScaled = true
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.4
+	label.Text = hpText(s.hp)
+	label.Parent = gui
+	if s.kind == 1 then
+		local ring = Instance.new("Highlight")
+		ring.FillTransparency = 1
+		ring.OutlineColor = Color3.new(1, 1, 1)
+		ring.DepthMode = Enum.HighlightDepthMode.Occluded
+		ring.Parent = model
+	end
+	model.Parent = folder
+	v.model, v.ball, v.mesh, v.label = model, ball, mesh, label
+	v.weapon = buildWeapon(s.kind, s.tier, s.wtype, s.r)
+	v.weapon.Parent = model
+	return v
+end
+
+local function destroyVisual(key)
+	local v = visuals[key]
+	if v then
+		v.model:Destroy()
+		visuals[key] = nil
+	end
+end
+
+function Render.onSnapshot(b: buffer)
+	local plot, seq, list = Codec.decode(b)
+	if not Codec.isNewer(seq, lastSeq[plot]) then
+		return -- unreliable events can arrive out of order
+	end
+	lastSeq[plot] = seq
+	local seen = {}
+	for _, s in list do
+		local key = plot * 65536 + s.id
+		seen[key] = true
+		local v = visuals[key]
+		if not v then
+			v = createVisual(plot, s)
+			visuals[key] = v
+		elseif s.tier ~= v.tier or s.wtype ~= v.wtype then
+			v.weapon:Destroy()
+			v.tier, v.wtype = s.tier, s.wtype
+			v.weapon = buildWeapon(s.kind, s.tier, s.wtype, s.r)
+			v.weapon.Parent = v.model
+		end
+		local lost = v.hp - s.hp
+		if lost > 0.5 then
+			v.hopT = 0
+			v.flash = 1
+			local pos = Vector3.new(s.x, FLOOR_Y + s.r * 2 + 0.5, s.z)
+			local big = lost >= v.maxHp * 0.25
+			Effects.floatText(pos, "-" .. Config.formatNumber(lost), big and Color3.fromRGB(255, 230, 90) or Color3.new(1, 1, 1), big and 1.4 or 1)
+			Effects.hit(pos, v.color)
+			if s.kind == 1 and plot == Render.localPlot and Render.onLocalHit then
+				Render.onLocalHit(lost)
+			end
+		end
+		v.hp, v.maxHp = s.hp, s.maxHp
+		v.tx, v.tz, v.ta = s.x, s.z, s.angle
+		v.label.Text = hpText(s.hp)
+	end
+	local previous = arenaKeys[plot]
+	if previous then
+		for key in previous do
+			if not seen[key] then
+				destroyVisual(key)
+			end
+		end
+	end
+	arenaKeys[plot] = seen
+end
+
+function Render.clearArena(plot: number)
+	local keys = arenaKeys[plot]
+	if keys then
+		for key in keys do
+			destroyVisual(key)
+		end
+	end
+	arenaKeys[plot] = nil
+end
+
+local TAU = math.pi * 2
+RunService.RenderStepped:Connect(function(dt)
+	local alpha = 1 - math.exp(-dt * 16)
+	for _, v in visuals do
+		v.x += (v.tx - v.x) * alpha
+		v.z += (v.tz - v.z) * alpha
+		local da = (v.ta - v.a + math.pi) % TAU - math.pi
+		v.a += da * alpha
+		v.hopT = math.min(1, v.hopT + dt / 0.3)
+		v.flash = math.max(0, v.flash - dt * 6)
+		local hop = math.sin(v.hopT * math.pi) * v.r * 0.45
+		-- Squash on impact, then spring back.
+		local squash = (1 - v.hopT) * 0.3
+		v.mesh.Scale = Vector3.new(1 + squash, 1 - squash, 1 + squash)
+		v.ball.Color = v.color:Lerp(Color3.new(1, 1, 1), v.flash)
+		local centre = CFrame.new(v.x, FLOOR_Y + v.r + hop, v.z)
+		v.ball.CFrame = centre
+		v.weapon:PivotTo(centre * CFrame.Angles(0, -v.a, 0))
+	end
+end)
+
+return Render
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">Ui</string>
+            <string name="Source"><![CDATA[-- All 2D interface, built in code: stats, best-drop bar, buttons, the rolling
+-- tier list and the equip/salvage popup. Works with mouse, touch and keys.
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local Effects = require(script.Parent:WaitForChild("Effects"))
+
+local Ui = {}
+Ui.busy = false -- true while a roll is animating or waiting for a choice
+
+local FONT = Enum.Font.FredokaOne
+local DARK = Color3.fromRGB(28, 30, 40)
+local WHITE = Color3.new(1, 1, 1)
+local YELLOW = Color3.fromRGB(255, 205, 60)
+
+local gui
+local refs = {}
+local state = nil
+local callbacks = {}
+
+local function new(class: string, props, children)
+	local inst = Instance.new(class)
+	for k, v in props do
+		if k ~= "Parent" then
+			inst[k] = v
+		end
+	end
+	for _, child in children or {} do
+		child.Parent = inst
+	end
+	inst.Parent = props.Parent
+	return inst
+end
+
+local function corner(radius: number?)
+	return new("UICorner", { CornerRadius = UDim.new(0, radius or 12) })
+end
+
+local function stroke(thickness: number?, color: Color3?)
+	return new("UIStroke", {
+		Thickness = thickness or 3,
+		Color = color or Color3.new(0, 0, 0),
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+local function text(props)
+	props.BackgroundTransparency = props.BackgroundTransparency or 1
+	props.Font = FONT
+	props.TextColor3 = props.TextColor3 or WHITE
+	props.TextScaled = true
+	if props.TextStrokeTransparency == nil then
+		props.TextStrokeTransparency = 0.5
+	end
+	return new("TextLabel", props)
+end
+
+local function button(props, onClick)
+	props.Font = FONT
+	props.TextColor3 = props.TextColor3 or WHITE
+	props.TextScaled = true
+	props.AutoButtonColor = true
+	props.TextStrokeTransparency = 0.4
+	local b = new("TextButton", props, { corner(14), stroke(3) })
+	new("UITextSizeConstraint", { MaxTextSize = 34, Parent = b })
+	new("UIPadding", {
+		PaddingLeft = UDim.new(0, 8),
+		PaddingRight = UDim.new(0, 8),
+		PaddingTop = UDim.new(0, 4),
+		PaddingBottom = UDim.new(0, 4),
+		Parent = b,
+	})
+	local scale = new("UIScale", { Parent = b })
+	b.Activated:Connect(function()
+		scale.Scale = 0.9
+		TweenService:Create(scale, TweenInfo.new(0.2, Enum.EasingStyle.Back), { Scale = 1 }):Play()
+		onClick()
+	end)
+	return b
+end
+
+local function pop(inst: GuiObject)
+	local scale = inst:FindFirstChildOfClass("UIScale") or new("UIScale", { Parent = inst })
+	scale.Scale = 0.6
+	TweenService:Create(scale, TweenInfo.new(0.35, Enum.EasingStyle.Back), { Scale = 1 }):Play()
+end
+
+---------------------------------------------------------------------------------
+-- Build
+---------------------------------------------------------------------------------
+local function buildHud()
+	-- Stats, top left
+	local stats = new("Frame", {
+		Name = "Stats",
+		BackgroundColor3 = DARK,
+		BackgroundTransparency = 0.25,
+		Position = UDim2.new(0, 10, 0, 10),
+		Size = UDim2.new(0, 170, 0, 128),
+		Parent = gui,
+	}, { corner(12), stroke(2) })
+	new("UIListLayout", { Padding = UDim.new(0, 2), Parent = stats })
+	new("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingTop = UDim.new(0, 6), Parent = stats })
+	local function stat(name)
+		return text({ Name = name, Size = UDim2.new(1, -10, 0, 28), TextXAlignment = Enum.TextXAlignment.Left, Parent = stats })
+	end
+	refs.power = stat("Power")
+	refs.keys = stat("Keys")
+	refs.dust = stat("Dust")
+	refs.luck = stat("Luck")
+
+	-- Best drop bar, top centre
+	local bar = new("Frame", {
+		Name = "BestDrop",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 10),
+		Size = UDim2.new(0, 360, 0, 58),
+		BackgroundColor3 = DARK,
+		BackgroundTransparency = 0.25,
+		Parent = gui,
+	}, { corner(12), stroke(2) })
+	text({ Text = "BEST DROP", Size = UDim2.new(1, 0, 0, 18), Position = UDim2.new(0, 0, 0, 2), Parent = bar })
+	local slots = new("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 8, 0, 22),
+		Size = UDim2.new(1, -16, 0, 28),
+		Parent = bar,
+	})
+	new("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		Padding = UDim.new(0, 4),
+		Parent = slots,
+	})
+	refs.slots = {}
+	for i = 1, #Config.Tiers do
+		local slot = new("Frame", {
+			Size = UDim2.new(0, 34, 0, 28),
+			BackgroundColor3 = Color3.fromRGB(60, 62, 75),
+			Parent = slots,
+		}, { corner(6), stroke(2) })
+		local q = text({ Text = "?", Size = UDim2.fromScale(1, 1), Parent = slot })
+		refs.slots[i] = { frame = slot, label = q }
+	end
+	refs.zoneLabel = text({
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 72),
+		Size = UDim2.new(0, 360, 0, 26),
+		TextStrokeTransparency = 0.2,
+		Parent = gui,
+	})
+
+	-- Main roll button, bottom centre
+	refs.roll = button({
+		Name = "Roll",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -16),
+		Size = UDim2.new(0, 230, 0, 70),
+		BackgroundColor3 = YELLOW,
+		TextColor3 = WHITE,
+		Text = "OPEN CHEST",
+		Parent = gui,
+	}, function()
+		callbacks.roll()
+	end)
+	refs.hint = text({
+		Name = "Hint",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -94),
+		Size = UDim2.new(0, 320, 0, 34),
+		TextColor3 = YELLOW,
+		TextStrokeTransparency = 0,
+		Text = "",
+		Parent = gui,
+	})
+
+	refs.dash = button({
+		Name = "Dash",
+		AnchorPoint = Vector2.new(1, 1),
+		Position = UDim2.new(0.5, -130, 1, -16),
+		Size = UDim2.new(0, 110, 0, 60),
+		BackgroundColor3 = Color3.fromRGB(80, 140, 255),
+		Text = "DASH [F]",
+		Parent = gui,
+	}, function()
+		callbacks.dash()
+	end)
+	refs.dashCover = new("Frame", {
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.45,
+		Size = UDim2.fromScale(1, 0),
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.fromScale(0, 1),
+		ZIndex = 3,
+		Parent = refs.dash,
+	}, { corner(14) })
+
+	refs.upgrade = button({
+		Name = "Upgrade",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0.5, 130, 1, -16),
+		Size = UDim2.new(0, 130, 0, 60),
+		BackgroundColor3 = Color3.fromRGB(160, 90, 255),
+		Text = "UPGRADE",
+		Parent = gui,
+	}, function()
+		callbacks.upgrade()
+	end)
+
+	-- Zone and camera controls, right side
+	local side = new("Frame", {
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.new(0, 150, 0, 210),
+		Parent = gui,
+	})
+	new("UIListLayout", { Padding = UDim.new(0, 8), HorizontalAlignment = Enum.HorizontalAlignment.Right, Parent = side })
+	refs.nextZone = button({
+		Size = UDim2.new(1, 0, 0, 64),
+		BackgroundColor3 = Color3.fromRGB(70, 190, 110),
+		Text = "NEXT ZONE",
+		Parent = side,
+	}, function()
+		callbacks.zone(1)
+	end)
+	refs.prevZone = button({
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundColor3 = Color3.fromRGB(90, 95, 110),
+		Text = "< BACK",
+		Parent = side,
+	}, function()
+		callbacks.zone(-1)
+	end)
+	refs.camera = button({
+		Size = UDim2.new(1, 0, 0, 44),
+		BackgroundColor3 = Color3.fromRGB(90, 95, 110),
+		Text = "CAMERA [C]",
+		Parent = side,
+	}, function()
+		callbacks.camera()
+	end)
+
+	refs.toast = text({
+		Name = "Toast",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.3, 0),
+		Size = UDim2.new(0.8, 0, 0, 48),
+		TextStrokeTransparency = 0,
+		TextTransparency = 1,
+		Parent = gui,
+	})
+end
+
+local function buildRollPanel()
+	local panel = new("Frame", {
+		Name = "RollPanel",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(0, 330, 0, 50 + #Config.Tiers * 34),
+		BackgroundColor3 = DARK,
+		Visible = false,
+		ZIndex = 10,
+		Parent = gui,
+	}, { corner(14), stroke(4, YELLOW) })
+	refs.rollTitle = text({
+		Size = UDim2.new(1, 0, 0, 40),
+		Position = UDim2.new(0, 0, 0, 4),
+		Text = "Rolling...",
+		TextColor3 = YELLOW,
+		TextStrokeTransparency = 0,
+		ZIndex = 11,
+		Parent = panel,
+	})
+	refs.rows = {}
+	for i, tier in Config.Tiers do
+		local color = Effects.rgb(tier.color)
+		local row = new("Frame", {
+			Position = UDim2.new(0, 10, 0, 44 + (i - 1) * 34),
+			Size = UDim2.new(1, -20, 0, 30),
+			BackgroundColor3 = color,
+			BackgroundTransparency = 0.7,
+			ZIndex = 11,
+			Parent = panel,
+		}, { corner(8) })
+		local rowStroke = stroke(0, WHITE)
+		rowStroke.Parent = row
+		text({
+			Text = tier.name,
+			Size = UDim2.new(0.6, 0, 1, -6),
+			Position = UDim2.new(0, 8, 0, 3),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextStrokeTransparency = 0.2,
+			ZIndex = 12,
+			Parent = row,
+		})
+		text({
+			Text = "1 in " .. Config.formatNumber(tier.oneIn),
+			Size = UDim2.new(0.4, -10, 1, -10),
+			Position = UDim2.new(0.6, 0, 0, 5),
+			TextXAlignment = Enum.TextXAlignment.Right,
+			TextStrokeTransparency = 0.2,
+			ZIndex = 12,
+			Parent = row,
+		})
+		refs.rows[i] = { frame = row, stroke = rowStroke }
+	end
+	refs.rollPanel = panel
+end
+
+local function card(parent, title, x)
+	local f = new("Frame", {
+		Position = UDim2.new(x, 6, 0, 0),
+		Size = UDim2.new(0.5, -12, 1, 0),
+		BackgroundColor3 = Color3.fromRGB(45, 48, 62),
+		ZIndex = 21,
+		Parent = parent,
+	}, { corner(10) })
+	text({ Text = title, Size = UDim2.new(1, 0, 0, 22), Position = UDim2.new(0, 0, 0, 4), ZIndex = 22, Parent = f })
+	local name = text({ Size = UDim2.new(1, -10, 0, 30), Position = UDim2.new(0, 5, 0, 30), ZIndex = 22, Parent = f })
+	local power = text({ Size = UDim2.new(1, -10, 0, 30), Position = UDim2.new(0, 5, 0, 64), ZIndex = 22, Parent = f })
+	return { frame = f, name = name, power = power }
+end
+
+local function buildResultPopup()
+	local popup = new("Frame", {
+		Name = "Result",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(0, 420, 0, 290),
+		BackgroundColor3 = DARK,
+		Visible = false,
+		ZIndex = 20,
+		Parent = gui,
+	}, { corner(16) })
+	refs.resultStroke = stroke(5, YELLOW)
+	refs.resultStroke.Parent = popup
+	refs.resultTitle = text({
+		Size = UDim2.new(1, 0, 0, 52),
+		Position = UDim2.new(0, 0, 0, 8),
+		TextStrokeTransparency = 0,
+		ZIndex = 21,
+		Parent = popup,
+	})
+	refs.resultOdds = text({
+		Size = UDim2.new(1, 0, 0, 22),
+		Position = UDim2.new(0, 0, 0, 60),
+		TextColor3 = Color3.fromRGB(200, 200, 210),
+		ZIndex = 21,
+		Parent = popup,
+	})
+	local cards = new("Frame", {
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 10, 0, 90),
+		Size = UDim2.new(1, -20, 0, 104),
+		ZIndex = 21,
+		Parent = popup,
+	})
+	refs.cardOld = card(cards, "EQUIPPED", 0)
+	refs.cardNew = card(cards, "NEW", 0.5)
+	refs.equip = button({
+		Position = UDim2.new(0, 16, 1, -76),
+		Size = UDim2.new(0.5, -24, 0, 60),
+		BackgroundColor3 = Color3.fromRGB(70, 190, 110),
+		Text = "EQUIP",
+		ZIndex = 21,
+		Parent = popup,
+	}, function()
+		Ui.finishRoll("equip")
+	end)
+	refs.salvage = button({
+		Position = UDim2.new(0.5, 8, 1, -76),
+		Size = UDim2.new(0.5, -24, 0, 60),
+		BackgroundColor3 = Color3.fromRGB(110, 110, 125),
+		Text = "SALVAGE",
+		ZIndex = 21,
+		Parent = popup,
+	}, function()
+		Ui.finishRoll("salvage")
+	end)
+	refs.result = popup
+end
+
+function Ui.build(cbs)
+	callbacks = cbs
+	gui = new("ScreenGui", {
+		Name = "HUD",
+		ResetOnSpawn = false,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		Parent = Players.LocalPlayer:WaitForChild("PlayerGui"),
+	})
+	buildHud()
+	buildRollPanel()
+	buildResultPopup()
+	Ui.refresh()
+end
+
+---------------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------------
+function Ui.setState(s)
+	local oldKeys = state and state.keys or 0
+	state = s
+	Ui.refresh()
+	if s.keys > oldKeys and not Ui.busy then
+		pop(refs.roll)
+	end
+end
+
+function Ui.getState()
+	return state
+end
+
+function Ui.refresh()
+	if not state then
+		refs.power.Text = "Loading..."
+		return
+	end
+	local s = state
+	refs.power.Text = "Power " .. Config.formatNumber(s.power)
+	refs.keys.Text = "Keys " .. s.keys
+	refs.dust.Text = "Dust " .. Config.formatNumber(s.dust)
+	local luckText = string.format("Luck x%.1f", s.luck)
+	if s.friends > 0 then
+		luckText ..= " (" .. s.friends .. " friend" .. (s.friends > 1 and "s" or "") .. ")"
+	end
+	refs.luck.Text = luckText
+
+	for i, slot in refs.slots do
+		if s.found[i] then
+			slot.frame.BackgroundColor3 = Effects.tierColor(i)
+			slot.label.Text = ""
+		else
+			slot.frame.BackgroundColor3 = Color3.fromRGB(60, 62, 75)
+			slot.label.Text = "?"
+		end
+		slot.frame:FindFirstChildOfClass("UIStroke").Color = (i == s.best) and WHITE or Color3.new(0, 0, 0)
+	end
+
+	local zone = Config.Zones[s.zone]
+	refs.zoneLabel.Text = string.format("Zone %d: %s   |   %s Lv.%d", s.zone, zone.name, s.equippedName, s.level)
+	refs.zoneLabel.TextColor3 = Effects.tierColor(s.equippedTier)
+
+	refs.roll.Text = "OPEN CHEST  (" .. s.keys .. ")"
+	refs.roll.BackgroundColor3 = s.keys > 0 and YELLOW or Color3.fromRGB(120, 115, 100)
+
+	if s.rolls == 0 and s.keys > 0 then
+		refs.hint.Text = "Open the chest! [E]"
+	elseif s.rolls == 0 then
+		refs.hint.Text = "Your ball fights on its own. Kills drop keys!"
+	elseif s.nextZonePower and s.power >= s.nextZonePower and s.zone == 1 then
+		refs.hint.Text = "You're strong enough for the next zone!"
+	else
+		refs.hint.Text = ""
+	end
+
+	refs.dash.Visible = true
+	refs.dash.Text = s.dashUnlocked and "DASH [F]" or "LOCKED"
+	refs.dash.BackgroundColor3 = s.dashUnlocked and Color3.fromRGB(80, 140, 255) or Color3.fromRGB(90, 95, 110)
+
+	refs.upgrade.Text = "UPGRADE (" .. Config.formatNumber(s.upgradeCost) .. " dust)"
+	refs.upgrade.BackgroundColor3 = s.dust >= s.upgradeCost and Color3.fromRGB(160, 90, 255) or Color3.fromRGB(90, 95, 110)
+
+	if s.nextZonePower then
+		local ready = s.power >= s.nextZonePower
+		refs.nextZone.Visible = true
+		refs.nextZone.Text = ready and "NEXT ZONE >" or ("NEXT ZONE\nneeds " .. Config.formatNumber(s.nextZonePower))
+		refs.nextZone.BackgroundColor3 = ready and Color3.fromRGB(70, 190, 110) or Color3.fromRGB(90, 95, 110)
+	else
+		refs.nextZone.Visible = false
+	end
+	refs.prevZone.Visible = s.zone > 1
+end
+
+---------------------------------------------------------------------------------
+-- Messages
+---------------------------------------------------------------------------------
+local toastToken = 0
+function Ui.toast(message: string, color: Color3?)
+	toastToken += 1
+	local token = toastToken
+	refs.toast.Text = message
+	refs.toast.TextColor3 = color or WHITE
+	refs.toast.TextTransparency = 0
+	pop(refs.toast)
+	task.delay(2.2, function()
+		if token == toastToken then
+			TweenService:Create(refs.toast, TweenInfo.new(0.4), { TextTransparency = 1 }):Play()
+		end
+	end)
+end
+
+function Ui.dashCooldown(seconds: number)
+	refs.dashCover.Size = UDim2.fromScale(1, 1)
+	TweenService:Create(refs.dashCover, TweenInfo.new(seconds, Enum.EasingStyle.Linear), { Size = UDim2.fromScale(1, 0) }):Play()
+end
+
+function Ui.setCameraLabel(on: boolean)
+	refs.camera.Text = on and "FREE CAM [C]" or "ARENA CAM [C]"
+end
+
+---------------------------------------------------------------------------------
+-- Rolling
+---------------------------------------------------------------------------------
+local onChoice = nil
+
+local function highlight(i: number?)
+	for j, row in refs.rows do
+		local on = j == i
+		row.frame.BackgroundTransparency = on and 0 or 0.7
+		row.stroke.Thickness = on and 3 or 0
+	end
+end
+
+-- Animates the tier list landing on `result.tier`, then shows the popup.
+-- `choose(choice)` is called with "equip" or "salvage".
+function Ui.playRoll(result, choose)
+	onChoice = choose
+	local tier = result.tier
+	local n = #Config.Tiers
+	refs.rollPanel.Visible = true
+	refs.rollTitle.Text = "Rolling..."
+	refs.rollTitle.TextColor3 = YELLOW
+	pop(refs.rollPanel)
+
+	-- Rarer results get a longer, tenser spin with a tease of the tier above.
+	local steps = 12 + math.min(tier, 6) * 2
+	for step = 1, steps do
+		local i
+		if step == steps then
+			i = tier
+		elseif step == steps - 1 and tier < n then
+			i = tier + 1
+		else
+			i = math.random(1, math.min(n, tier + 3))
+		end
+		highlight(i)
+		task.wait(0.04 + (step / steps) ^ 3 * 0.32)
+	end
+	local tierInfo = Config.Tiers[tier]
+	local color = Effects.rgb(tierInfo.color)
+	refs.rollTitle.Text = string.upper(tierInfo.name) .. "!"
+	refs.rollTitle.TextColor3 = color
+	pop(refs.rollTitle)
+	if tier >= 4 then
+		Effects.shake(0.6 + tier * 0.15, 0.5)
+	end
+	task.wait(0.7)
+	refs.rollPanel.Visible = false
+	highlight(nil)
+
+	-- Result popup
+	refs.resultTitle.Text = string.upper(tierInfo.name) .. "!" .. (result.newBest and "  NEW BEST!" or "")
+	refs.resultTitle.TextColor3 = color
+	refs.resultStroke.Color = color
+	refs.resultOdds.Text = "1 in " .. Config.formatNumber(result.oneIn)
+	refs.cardOld.name.Text = result.currentName
+	refs.cardOld.name.TextColor3 = Effects.tierColor(result.currentTier)
+	refs.cardOld.power.Text = Config.formatNumber(result.currentPower) .. " power"
+	refs.cardNew.name.Text = result.name
+	refs.cardNew.name.TextColor3 = color
+	local better = result.power > result.currentPower
+	refs.cardNew.power.Text = Config.formatNumber(result.power) .. " power " .. (better and "▲" or "▼")
+	refs.cardNew.power.TextColor3 = better and Color3.fromRGB(120, 255, 140) or Color3.fromRGB(255, 110, 110)
+	refs.salvage.Text = "SALVAGE +" .. result.salvage
+	refs.equip.BackgroundColor3 = better and Color3.fromRGB(70, 190, 110) or Color3.fromRGB(90, 95, 110)
+	refs.salvage.BackgroundColor3 = better and Color3.fromRGB(90, 95, 110) or Color3.fromRGB(70, 190, 110)
+	refs.result.Visible = true
+	pop(refs.result)
+end
+
+function Ui.finishRoll(choice: string)
+	if not refs.result.Visible then
+		return
+	end
+	refs.result.Visible = false
+	local cb = onChoice
+	onChoice = nil
+	if cb then
+		cb(choice)
+	end
+end
+
+return Ui
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+</roblox>
